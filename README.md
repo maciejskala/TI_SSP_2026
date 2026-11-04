@@ -1,4 +1,3 @@
-# TI_SSP_2026
 # Reactive Multi-Homing Link Selection Based on Active Uplink Quality Measurements
 
 SDN project for the *Sieci Sterowane Programowo* (Software-Defined Networks) course, AGH University of Krakow, winter semester 2026/27.
@@ -32,6 +31,8 @@ The project falls under the course topic *dynamic routing depending on link load
 - NAT or per-uplink public addressing. Both uplinks lead to the same destination network, so flows keep their addresses when migrated and TCP sessions survive the switch. The limitations of migrating stateful sessions across NAT-ed ISP uplinks are discussed in the documentation but not implemented.
 - Multi-switch topology discovery, Dijkstra-style path computation and loop handling. The topology is fixed and known to the application.
 - Deep packet inspection. Classification uses L3/L4 header fields only.
+- Spanning-tree or any other generic loop-prevention mechanism; the `s1`–`s2` loop is handled by design (Section 3.1).
+- Control of the internal routers in Topology 2. They run standard OSPF (FRR) and are not managed by the SDN controller.
 - Elephant-flow detection — a possible extension if time permits (see Section 8).
 
 ### Course requirements this design satisfies
@@ -41,11 +42,11 @@ The project falls under the course topic *dynamic routing depending on link load
 - **Real-time demonstration** on a running virtual network with traffic generators (Section 7).
 
 ## 3. Topologies
- 
+
 Two topologies share the same uplink section and the same controller application. Topology 1 is the development and baseline environment; Topology 2 is the "production-like" scenario used for the final demonstration.
- 
+
 ### 3.1 Common uplink section
- 
+
 ```
                       +----------------+
                       |   uplink A     |
@@ -56,33 +57,36 @@ Two topologies share the same uplink section and the same controller application
                       |   2 ms)        |
                       +----------------+
 ```
- 
+
 - `s1` — edge switch (OpenFlow 1.3, controlled by the application). All decisions are made here.
 - `s2` — aggregation switch on the "Internet" side, also controlled by the application but with a fixed, static set of rules (see loop handling below).
 - `srv` — destination for all external traffic (runs `iperf` server, HTTP server, probe responder).
 - Both uplinks are plain L2 paths to the same destination network. There is no NAT and no separate ISP router per uplink, so a flow keeps its addresses when migrated between uplinks.
 - Uplink parameters are set with Mininet `TCLink` and can be changed at runtime with `tc qdisc ... netem` to emulate degradation (added delay, loss, bandwidth reduction).
+
 Exact bandwidth and delay values are a starting point and will be tuned so that a single bulk flow saturates uplink B but not uplink A.
- 
+
 **Loop handling.** Two parallel links between `s1` and `s2` form an L2 loop. To avoid broadcast storms:
- 
+
 - `s2` never floods. It carries three static rules installed by the controller at connection time: uplink A port → `srv` port, uplink B port → `srv` port, and `srv` port → the uplink currently designated as *primary* by the controller (updated on failover).
 - `s1` sends broadcast frames (ARP) towards the Internet side on the primary uplink only; towards the LAN side it floods normally.
 - No spanning-tree protocol is used; this is a deliberate design assumption of the project.
+
 ### 3.2 Topology 1 — flat LAN (baseline)
- 
+
 ```
    h1 ──┐
    h2 ──┤   ┌────┐
    h3 ──┼───│ s1 │════ uplinks A/B ════ s2 ── srv
    h4 ──┘   └────┘
 ```
- 
+
 - `h1..h4` — hosts in a single subnet `10.0.0.0/24`, directly attached to `s1`.
 - `srv` is in the same subnet; no routing is involved anywhere.
 - Used for development, unit testing of the decision logic and the first part of the demonstration.
+
 ### 3.3 Topology 2 — routed site behind the multi-homed edge
- 
+
 ```
  10.1.0.0/24 ── r1 ──┐
  (h1, h2)            │  10.0.0.0/24
@@ -93,35 +97,39 @@ Exact bandwidth and delay values are a starting point and will be tuned so that 
  10.3.0.0/24 ── r3 ──┘      r1, r2, r3 are also interconnected (OSPF)
  (h5)
 ```
- 
+
 - `r1..r3` — Linux routers (Mininet hosts with `ip_forward=1`) running **FRR with OSPF** between themselves, each serving one LAN subnet. OSPF gives the internal network its own convergence, independent of the controller.
 - The upstream interfaces of `r1..r3` and `srv` share the segment `10.0.0.0/24` on the LAN side of `s1`. Routers use `srv` as their default gateway; `srv` has static routes back to `10.x.0.0/24` via the corresponding router.
 - `s1` aggregates traffic from all internal subnets and applies the same per-flow uplink selection as in Topology 1.
+
 **Impact on the controller.** The decision logic is unchanged — classification already uses L3/L4 fields, so the fact that frames arrive with a router's source MAC is irrelevant. The only addition is a *prefix → LAN port* mapping for return traffic from the uplinks, learned from `packet_in` (source IP and ingress port) or configured statically. Optionally, a per-site policy can be expressed in the configuration (e.g. subnet `10.3.0.0/24` — guest network — is always placed on the cheaper uplink B unless it is down).
- 
+
 **What Topology 2 demonstrates.**
- 
+
 - Flows from different subnets are distributed across uplinks by class, not by origin — the decision is genuinely per-flow.
 - Two independent layers of reactivity: an internal link failure (`r1–r2` down) is handled by OSPF, while uplink degradation is handled by the controller; neither interferes with the other.
 - The edge is transparent to the internal routing domain; adding a fourth router or subnet requires no controller change.
+
 **Fallback.** If running FRR inside Mininet namespaces proves time-consuming, Topology 2 is reduced to static routing on `r1..r3`. The controller-side behaviour and the demonstration value are the same; only the internal-convergence scenario is dropped.
- 
+
 ## 4. Measurement
- 
+
 ### Active probing
- 
+
 Every `T_probe` (default 1 s) the controller sends a probe packet through each uplink port using `packet_out`. Probes carry a timestamp and sequence number. The remote side (or a flow rule on `s2`) sends them back; the controller matches the reply in `packet_in` and computes:
- 
+
 - RTT (exponentially weighted moving average and last sample),
 - loss ratio over a sliding window of the last `N` probes.
+
 ### Passive statistics
- 
+
 Every `T_stats` (default 2 s) the controller issues `OFPPortStatsRequest` and `OFPFlowStatsRequest` to `s1` and derives:
- 
+
 - per-uplink utilisation (bytes/s relative to the configured link rate),
 - per-flow throughput (used for classification refinement and the optional elephant-flow extension).
+
 ### Events
- 
+
 - `OFPPortStatus` / port down → immediate failover of all flows on that uplink.
 - Probe loss over the window above a hard threshold → uplink declared *down* even if the port is up (silent failure).
 
@@ -170,6 +178,11 @@ Traffic generators: `iperf`/`iperf3` (TCP bulk, UDP constant-bitrate "VoIP"), `p
 3. **Failure.** Bring uplink A down. All flows fail over to B; the bulk transfer slows down but continues. Bring A back up and show the flows being rebalanced.
 4. **Control run.** Repeat scenario 2 with the decision logic disabled (static assignment) to show the difference.
 
+Steps 1–4 are run on Topology 1. The demonstration then switches to Topology 2:
+
+5. **Routed site.** Start latency-sensitive and bulk flows from hosts in different subnets (`10.1/24`, `10.2/24`, `10.3/24`). Show on the dashboard that uplink assignment follows the flow class regardless of the source subnet, and that the guest subnet policy is honoured.
+6. **Two layers of reactivity.** Bring the internal link `r1–r2` down; OSPF reconverges and traffic from `10.1/24` keeps flowing through its assigned uplink. Then degrade uplink B as in step 2; the controller migrates the affected flows while the internal routing is untouched.
+
 Each step is visible both in terminals and on the dashboard.
 
 ## 8. Possible extensions
@@ -185,7 +198,7 @@ Aligned with the course schedule:
 | Milestone                                 | Deliverable                                          |
 |-------------------------------------------|------------------------------------------------------|
 | Topic and literature, Git repository      | this README, short literature list                   |
-| Topology                                  | Mininet script, parameters, `netem` helper scripts   |
+| Topology                                  | Mininet scripts for Topology 1 and 2, FRR configs, `netem` helper scripts |
 | Applications / traffic generators         | generator scripts, probe responder on `srv`          |
 | Algorithm                                 | controller application, configuration, dashboard     |
 | Presentation (21.01.2027)                 | live demo, technical documentation, slides           |
@@ -195,7 +208,7 @@ Aligned with the course schedule:
 ```
 .
 ├── controller/        # Ryu/OS-Ken application (main app, probing, stats, decision, dashboard)
-├── topology/          # Mininet topology and runtime link manipulation scripts
+├── topology/          # Mininet topologies (flat LAN, routed site), FRR configs, runtime link manipulation scripts
 ├── traffic/           # traffic generator and probe responder scripts
 ├── dashboard/         # static HTML/JS for the live view
 ├── config/            # thresholds, weights, link parameters
@@ -207,12 +220,50 @@ Aligned with the course schedule:
 
 - Ubuntu 22.04 (VM or container)
 - Mininet 2.3.x, Open vSwitch 2.17+
-- Python 3.10+, `os-ken` (or Ryu 4.34 on Python 3.8/3.9)
+- Python 3.10+, `os-ken` (or Ryu 4.34 on Python 3.8/3.9), `networkx` not required
 - `iperf3`, `iproute2` (`tc`), `hping3`
+- FRRouting 8.x (`ospfd`, `zebra`) for Topology 2
 
 ## 12. Team
 
-- Maciej Dyrdał
-- Mateusz Purol
-- Maciej Skała
-- Szymon Wątroba
+To be filled in.
+
+## 13. References
+
+### SDN foundations and tooling
+
+1. N. McKeown, T. Anderson, H. Balakrishnan, G. Parulkar, L. Peterson, J. Rexford, S. Shenker, J. Turner, "OpenFlow: Enabling Innovation in Campus Networks," *ACM SIGCOMM Computer Communication Review*, vol. 38, no. 2, pp. 69–74, 2008. DOI: 10.1145/1355734.1355746
+2. D. Kreutz, F. M. V. Ramos, P. Verissimo, C. E. Rothenberg, S. Azodolmolky, S. Uhlig, "Software-Defined Networking: A Comprehensive Survey," *Proceedings of the IEEE*, vol. 103, no. 1, pp. 14–76, 2015. DOI: 10.1109/JPROC.2014.2371999
+3. Open Networking Foundation, *OpenFlow Switch Specification, Version 1.3.5 (Protocol version 0x04)*, ONF TS-023, March 2015. https://opennetworking.org/wp-content/uploads/2014/10/openflow-switch-v1.3.5.pdf
+4. B. Lantz, B. Heller, N. McKeown, "A Network in a Laptop: Rapid Prototyping for Software-Defined Networks," *Proc. 9th ACM SIGCOMM Workshop on Hot Topics in Networks (HotNets-IX)*, Monterey, CA, 2010. DOI: 10.1145/1868447.1868466
+5. Ryu SDN Framework Community, *Ryu SDN Framework* (ryu-book) and Ryu API documentation; OpenStack, *OS-Ken* documentation. (technical references, no DOI)
+
+### Measurement and monitoring in OpenFlow networks (Section 4)
+
+6. N. L. M. van Adrichem, C. Doerr, F. A. Kuipers, "OpenNetMon: Network Monitoring in OpenFlow Software-Defined Networks," *Proc. IEEE/IFIP Network Operations and Management Symposium (NOMS)*, Kraków, 2014, pp. 1–8. DOI: 10.1109/NOMS.2014.6838228
+7. S. R. Chowdhury, M. F. Bari, R. Ahmed, R. Boutaba, "PayLess: A Low Cost Network Monitoring Framework for Software Defined Networks," *Proc. IEEE/IFIP NOMS*, Kraków, 2014, pp. 1–9. DOI: 10.1109/NOMS.2014.6838227
+8. K. Phemius, M. Bouet, "Monitoring Latency with OpenFlow," *Proc. 9th International Conference on Network and Service Management (CNSM)*, Zurich, 2013, pp. 122–125. DOI: 10.1109/CNSM.2013.6727820
+
+### Link selection, traffic engineering and multi-homing (Section 5)
+
+9. G. Rzym, Z. Duliński, P. Chołda, "Dynamic Link Metric Selection for Traffic Aggregation and Multipath Transmission in Software-Defined Networks," *Applied Sciences*, vol. 14, no. 12, art. 5312, 2024. DOI: 10.3390/app14125312
+10. B. Isyaku, K. A. Bakar, M. S. Mohd Zahid, E. Alkhammash, F. Saeed, F. A. Ghaleb, "Route Path Selection Optimization Scheme Based Link Quality Estimation and Critical Switch Awareness for Software Defined Networks," *Applied Sciences*, vol. 11, no. 19, art. 9100, 2021. DOI: 10.3390/app11199100
+11. I. F. Akyildiz, A. Lee, P. Wang, M. Luo, W. Chou, "A Roadmap for Traffic Engineering in SDN-OpenFlow Networks," *Computer Networks*, vol. 71, pp. 1–30, 2014. DOI: 10.1016/j.comnet.2014.06.002
+12. Z. Yang, Y. Cui, B. Li, Y. Liu, Y. Xu, "Software-Defined Wide Area Network (SD-WAN): Architecture, Advances and Opportunities," *Proc. 28th International Conference on Computer Communication and Networks (ICCCN)*, Valencia, 2019, pp. 1–9. DOI: 10.1109/ICCCN.2019.8847124
+13. C. Fu, B. Wang, W. Wang, "Software-Defined Wide Area Networks (SD-WANs): A Survey," *Electronics*, vol. 13, no. 15, art. 3011, 2024. DOI: 10.3390/electronics13153011
+14. J. Abley, K. Lindqvist, E. Davies, B. Black, V. Gill, "IPv4 Multihoming Practices and Limitations," RFC 4116, IETF, July 2005. https://www.rfc-editor.org/rfc/rfc4116
+15. S. Jain et al., "B4: Experience with a Globally-Deployed Software Defined WAN," *Proc. ACM SIGCOMM*, Hong Kong, 2013.
+
+### Resilience and failover (Section 7, step 3)
+
+16. S. Sharma, D. Staessens, D. Colle, M. Pickavet, P. Demeester, "OpenFlow: Meeting Carrier-Grade Recovery Requirements," *Computer Communications*, vol. 36, no. 6, pp. 656–665, 2013.
+17. C. Villamizar, R. Chandra, R. Govindan, "BGP Route Flap Damping," RFC 2439, IETF, November 1998. https://www.rfc-editor.org/rfc/rfc2439
+
+### Internal routing (Topology 2)
+
+18. J. Moy, "OSPF Version 2," RFC 2328, IETF, April 1998. https://www.rfc-editor.org/rfc/rfc2328
+19. FRRouting Project, *FRRouting User Guide* — https://docs.frrouting.org/
+
+### Extension (Section 8)
+
+20. M. Al-Fares, S. Radhakrishnan, B. Raghavan, N. Huang, A. Vahdat, "Hedera: Dynamic Flow Scheduling for Data Center Networks," *Proc. 7th USENIX Symposium on Networked Systems Design and Implementation (NSDI)*, San Jose, CA, 2010.
